@@ -7,6 +7,7 @@ and Polymarket sports markets via the Simmer SDK.
 import os
 import sys
 import json
+import time
 import requests
 from datetime import datetime, timedelta
 
@@ -17,9 +18,10 @@ SKILL_SLUG = "polymarket-sports-edge"
 TRADE_SOURCE = f"sdk:{SKILL_SLUG}"
 
 # ── Configuration (all overridable via env) ──────────────────────────
-MIN_DIVERGENCE = float(os.environ.get("MIN_DIVERGENCE", "0.08"))
+MIN_DIVERGENCE = float(os.environ.get("MIN_DIVERGENCE", "0.05"))
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "10.0"))
 DRY_RUN = os.environ.get("LIVE", "").lower() != "true"
+API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 
 DEFAULT_SPORTS = [
     "basketball_nba",
@@ -32,6 +34,15 @@ DEFAULT_SPORTS = [
 ]
 SPORTS = os.environ.get("SPORTS", "").split(",") if os.environ.get("SPORTS") else DEFAULT_SPORTS
 
+# Futures / outrights sport keys (championship winners)
+DEFAULT_FUTURES = [
+    "basketball_nba_championship_winner",
+    "americanfootball_nfl_super_bowl_winner",
+    "icehockey_nhl_championship_winner",
+    "baseball_mlb_world_series_winner",
+]
+FUTURES = os.environ.get("FUTURES", "").split(",") if os.environ.get("FUTURES") else DEFAULT_FUTURES
+
 # Search terms to find sports markets on Simmer
 SPORT_QUERIES = {
     "basketball_nba": "NBA",
@@ -41,6 +52,14 @@ SPORT_QUERIES = {
     "mma_mixed_martial_arts": "UFC",
     "soccer_epl": "Premier League",
     "soccer_usa_mls": "MLS",
+}
+
+# Simmer search queries for futures markets (tuned to actual market question text)
+FUTURES_QUERIES = {
+    "basketball_nba_championship_winner": ["NBA Finals", "NBA championship"],
+    "americanfootball_nfl_super_bowl_winner": ["NFL league championship", "Super Bowl"],
+    "icehockey_nhl_championship_winner": ["Stanley Cup", "NHL Stanley Cup"],
+    "baseball_mlb_world_series_winner": ["World Series", "MLB World Series"],
 }
 
 # ── Simmer client (lazy singleton) ──────────────────────────────────
@@ -56,18 +75,53 @@ def get_client():
     return _client
 
 
+def simmer_search(query, retries=2):
+    """Search Simmer markets with retry on transient errors (502, timeout)."""
+    api_key = os.environ["SIMMER_API_KEY"]
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(
+                "https://api.simmer.markets/api/sdk/markets",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"q": query, "status": "active", "limit": 50},
+                timeout=API_TIMEOUT,
+            )
+            if resp.status_code == 502 and attempt < retries:
+                log(f"  Simmer 502 on '{query}', retrying ({attempt + 1}/{retries})...")
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            markets = resp.json()
+            if isinstance(markets, dict):
+                markets = markets.get("markets", markets.get("data", []))
+            return markets
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                log(f"  Simmer timeout on '{query}', retrying ({attempt + 1}/{retries})...")
+                time.sleep(2)
+                continue
+            raise
+    return []
+
+
 # ── Odds API helpers ────────────────────────────────────────────────
+def is_outright_sport(sport_key):
+    """Check if a sport key is for outrights/futures (ends with _winner)."""
+    return sport_key.endswith("_winner")
+
+
 def fetch_odds(sport_key):
     """Fetch upcoming/live odds from The Odds API for a given sport."""
     api_key = os.environ["THE_ODDS_API_KEY"]
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+    market_type = "outrights" if is_outright_sport(sport_key) else "h2h"
     params = {
         "apiKey": api_key,
         "regions": "us",
-        "markets": "h2h",
+        "markets": market_type,
         "oddsFormat": "decimal",
     }
-    resp = requests.get(url, params=params, timeout=15)
+    resp = requests.get(url, params=params, timeout=API_TIMEOUT)
     if resp.status_code == 422:
         # Sport not currently in season
         return []
@@ -88,6 +142,36 @@ def consensus_prob(game, team_name):
                     if decimal_odds > 0:
                         probs.append(1.0 / decimal_odds)
     return sum(probs) / len(probs) if probs else None
+
+
+def consensus_prob_outright(events, team_name):
+    """Average implied probability across all bookmakers for a team in outrights markets."""
+    probs = []
+    team_lower = team_name.lower()
+    for event in events:
+        for bookmaker in event.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market["key"] != "outrights":
+                    continue
+                for outcome in market["outcomes"]:
+                    if outcome["name"].lower() == team_lower:
+                        decimal_odds = outcome["price"]
+                        if decimal_odds > 0:
+                            probs.append(1.0 / decimal_odds)
+    return sum(probs) / len(probs) if probs else None
+
+
+def get_outright_teams(events):
+    """Extract all unique team/player names from outrights events."""
+    teams = set()
+    for event in events:
+        for bookmaker in event.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market["key"] != "outrights":
+                    continue
+                for outcome in market["outcomes"]:
+                    teams.add(outcome["name"])
+    return teams
 
 
 # ── Matching ────────────────────────────────────────────────────────
@@ -166,19 +250,9 @@ def scan_sport(sport_key):
 
     log(f"{label}: Found {len(games)} games with odds")
 
-    # 2. Get Simmer markets for this sport via REST (SDK doesn't support text search)
+    # 2. Get Simmer markets for this sport
     try:
-        api_key = os.environ["SIMMER_API_KEY"]
-        resp = requests.get(
-            "https://api.simmer.markets/api/sdk/markets",
-            headers={"Authorization": f"Bearer {api_key}"},
-            params={"q": label, "status": "active", "limit": 50},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        markets = resp.json()
-        if isinstance(markets, dict):
-            markets = markets.get("markets", markets.get("data", []))
+        markets = simmer_search(label)
     except Exception as e:
         log(f"{label}: Simmer API error — {e}")
         return []
@@ -232,11 +306,11 @@ def scan_sport(sport_key):
         if book_prob is None:
             continue
 
-        divergence = book_prob - market_price
+        divergence = round(book_prob - market_price, 4)
 
         log(
             f"  Matched: \"{question[:60]}\" → {yes_team} vs {no_team}\n"
-            f"    Polymarket YES: {market_price:.2f} | Books: {book_prob:.2f} | "
+            f"    Polymarket YES: {market_price:.3f} | Books: {book_prob:.3f} | "
             f"Divergence: {divergence:+.2f}"
         )
 
@@ -252,6 +326,106 @@ def scan_sport(sport_key):
             no_book = 1.0 - book_prob
             trades.append(
                 execute_trade(market_id, "no", no_price, no_book, -divergence, question, no_team)
+            )
+
+    return trades
+
+
+def match_market_to_outright(market_question, outright_teams):
+    """
+    Match a Simmer futures market question to a team from outrights data.
+    Returns the matched team name or None.
+    """
+    q = normalize(market_question)
+    best_team = None
+    best_score = 0
+
+    for team in outright_teams:
+        tokens = team_tokens(team)
+        hits = sum(1 for t in tokens if t in q and len(t) > 2)
+        if hits >= 1 and hits > best_score:
+            best_score = hits
+            best_team = team
+
+    return best_team
+
+
+def scan_futures(sport_key):
+    """Scan futures/outrights markets for divergence. Returns list of trades."""
+    queries = FUTURES_QUERIES.get(sport_key, [sport_key])
+    label = queries[0]
+    log(f"Futures {label}: Fetching outrights...")
+
+    # 1. Get outrights from Odds API
+    try:
+        events = fetch_odds(sport_key)
+    except Exception as e:
+        log(f"Futures {label}: Odds API error — {e}")
+        return []
+
+    if not events:
+        log(f"Futures {label}: No outrights available.")
+        return []
+
+    outright_teams = get_outright_teams(events)
+    log(f"Futures {label}: Found {len(outright_teams)} teams in outrights")
+
+    # 2. Search Simmer for futures markets using multiple queries
+    seen_ids = set()
+    all_markets = []
+    for query in queries:
+        try:
+            markets = simmer_search(query)
+            for m in markets:
+                mid = m.get("id", "")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_markets.append(m)
+        except Exception as e:
+            log(f"Futures {label}: Simmer search '{query}' error — {e}")
+
+    if not all_markets:
+        log(f"Futures {label}: No active markets on Simmer.")
+        return []
+
+    log(f"Futures {label}: Found {len(all_markets)} Simmer markets to check")
+
+    # 3. Match and compare
+    trades = []
+    for market in all_markets:
+        question = market.get("question", "")
+        market_id = market.get("id", "")
+        market_price = market.get("current_probability") or market.get("external_price_yes")
+
+        if market_price is None:
+            continue
+
+        # For futures, we WANT markets with futures keywords
+        team = match_market_to_outright(question, outright_teams)
+        if team is None:
+            continue
+
+        book_prob = consensus_prob_outright(events, team)
+        if book_prob is None:
+            continue
+
+        divergence = round(book_prob - market_price, 4)
+
+        log(
+            f"  Matched: \"{question[:60]}\" → {team}\n"
+            f"    Polymarket YES: {market_price:.3f} | Books: {book_prob:.3f} | "
+            f"Divergence: {divergence:+.2f}"
+        )
+
+        if divergence >= MIN_DIVERGENCE:
+            trades.append(
+                execute_trade(market_id, "yes", market_price, book_prob, divergence, question, team)
+            )
+        elif divergence <= -MIN_DIVERGENCE:
+            no_price = 1.0 - market_price
+            no_book = 1.0 - book_prob
+            trades.append(
+                execute_trade(market_id, "no", no_price, no_book, -divergence, question, team)
             )
 
     return trades
@@ -295,11 +469,18 @@ def log(msg):
 
 
 def main():
-    log(f"Scanning {len(SPORTS)} sports... (dry_run={DRY_RUN}, min_divergence={MIN_DIVERGENCE:.0%})")
+    log(f"Scanning {len(SPORTS)} sports + {len(FUTURES)} futures... (dry_run={DRY_RUN}, min_divergence={MIN_DIVERGENCE:.0%})")
 
     all_trades = []
+
+    # Game-level h2h scanning
     for sport_key in SPORTS:
         trades = scan_sport(sport_key)
+        all_trades.extend(trades)
+
+    # Futures/outrights scanning
+    for sport_key in FUTURES:
+        trades = scan_futures(sport_key)
         all_trades.extend(trades)
 
     executed = [t for t in all_trades if not (isinstance(t, dict) and t.get("dry_run"))]
